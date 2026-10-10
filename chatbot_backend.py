@@ -1,7 +1,10 @@
+from __future__ import annotations
+import tempfile
+
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
-from typing import Annotated, Literal, Tuple, TypedDict
-from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor //TODO: Explain me why we use this
+from typing import Annotated, Any, Dict, Optional, TypedDict
+from urllib.parse import urlparse //TODO: Explain me why we use this
 import sqlite3
 
 import requests
