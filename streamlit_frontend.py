@@ -252,6 +252,7 @@ TOOL_LABELS = {
     'web_search': 'Searching the web',
     'calculator': 'Calculating',
     'get_current_datetime': 'Checking the time',
+    'search_pdf': 'Reading javascript.pdf',
 }
 MAX_IMAGES, MAX_SOURCES = 4, 5
 
