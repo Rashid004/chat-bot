@@ -1,0 +1,22 @@
+# Design system: Dark Mode (OLED) + developer typography (IBM Plex Sans / JetBrains Mono), green accent.
+# Streamlit reads this only when started from this folder: cd ai-agent && streamlit run blog_writer_ui.py
+[theme]
+base = "dark"
+primaryColor = "#22C55E"
+backgroundColor = "#0F172A"
+secondaryBackgroundColor = "#1B2336"
+textColor = "#F8FAFC"
+borderColor = "#334155"
+linkColor = "#4ADE80"
+font = "IBM Plex Sans:https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap"
+baseRadius = "10px"
+buttonRadius = "10px"
+showWidgetBorder = true
+
+[theme.sidebar]
+backgroundColor = "#0B1220"
+secondaryBackgroundColor = "#1B2336"
+borderColor = "#334155"
+
+[client]
+toolbarMode = "minimal"
