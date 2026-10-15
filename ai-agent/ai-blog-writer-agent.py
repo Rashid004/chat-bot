@@ -3,10 +3,10 @@ from __future__ import annotations
 import operator
 import os
 import re
-from datetime import date, timedelta
 from pathlib import Path
 from typing import TypedDict, List, Optional, Literal, Annotated
 
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 from langgraph.graph import StateGraph, START, END
@@ -14,33 +14,48 @@ from langgraph.types import Send
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
-from langchain_community.tools.tavily_search import TavilySearchResults
+from langchain_tavily import TavilySearch
+
+load_dotenv()  # root ki .env se OPENAI_API_KEY / TAVILY_API_KEY / GEMINI_API_KEY uthata hai
+
+# -----------------------------
+# 0) Token / cost limits (yahin se sab kuch control hota hai)
+# -----------------------------
+MAX_SECTIONS = 6          # plan me kitne sections (har section = 1 LLM call)
+MAX_QUERIES = 3           # Tavily searches per run
+RESULTS_PER_QUERY = 4     # Tavily results per search
+SNIPPET_CHARS = 200       # evidence snippet ki max length
+PLAN_MAX_TOKENS = 2000    # router/planner output cap
+SECTION_MAX_TOKENS = 1000 # ek section ka output cap (~550 words ~ 800 tokens)
+IMAGE_PLAN_MAX_TOKENS = 8000  # image step poora blog wapas likhta hai, isliye bada cap
+MAX_IMAGES = 3            # Gemini image calls per run
+OUT_DIR = Path(__file__).parent / "blogs"
 
 # -----------------------------
 # 1) Schemas
 # -----------------------------
 
-class Task(BaseModel): 
-  id: int
-  title: str
-  
-  goal: str = Field(
-      ...,
-      description="One sentence describing what the reader should be able to do/understand after this section.",
-  )
-  bullets: List[str] = Field(
-      ...,
-      min_length=3,
-      max_length=6,
-      description="3–6 concrete, non-overlapping subpoints to cover in this section.",
+class Task(BaseModel):
+    id: int
+    title: str
+
+    goal: str = Field(
+        ...,
+        description="One sentence describing what the reader should be able to do/understand after this section.",
     )
-  target_words: int = Field(..., description="Target word count for this section (120–550).")
-  
-  tags: List[str] = Field(default_factory=list)
-  requires_research: bool = False
-  requires_citations: bool = False
-  requires_code: bool = False
-  
+    bullets: List[str] = Field(
+        ...,
+        min_length=3,
+        max_length=6,
+        description="3–6 concrete, non-overlapping subpoints to cover in this section.",
+    )
+    target_words: int = Field(..., description="Target word count for this section (120–550).")
+
+    tags: List[str] = Field(default_factory=list)
+    requires_research: bool = False
+    requires_citations: bool = False
+    requires_code: bool = False
+
 class Plan(BaseModel):
     blog_title: str
     audience: str
@@ -48,23 +63,19 @@ class Plan(BaseModel):
     blog_kind: Literal["explainer", "tutorial", "news_roundup", "comparison", "system_design"] = "explainer"
     constraints: List[str] = Field(default_factory=list)
     tasks: List[Task]
-    
+
 class EvidenceItem(BaseModel):
     title: str
     url: str
     published_at: Optional[str] = None  # keep if Tavily provides; DO NOT rely on it
     snippet: Optional[str] = None
     source: Optional[str] = None
-    
+
 class RouterDecision(BaseModel):
     needs_research: bool
     mode: Literal["closed_book", "hybrid", "open_book"]
     queries: List[str] = Field(default_factory=list)
 
-
-class EvidencePack(BaseModel):
-    evidence: List[EvidenceItem] = Field(default_factory=list)
-    
 class ImageSpec(BaseModel):
     placeholder: str = Field(..., description="e.g. [[IMAGE_1]]")
     filename: str = Field(..., description="Save under images/, e.g. qkv_flow.png")
@@ -78,32 +89,40 @@ class ImageSpec(BaseModel):
 class GlobalImagePlan(BaseModel):
     md_with_placeholders: str
     images: List[ImageSpec] = Field(default_factory=list)
-    
+
 class State(TypedDict):
-  topic: str
-  
-  # routing / research
-  mode: str
-  needs_research: bool
-  queries: List[str]
-  evidence: List[EvidenceItem]
-  plan: Optional[Plan]
+    topic: str
 
-  # workers
-  sections: Annotated[List[tuple[int, str]], operator.add]  # (task_id,section_md)
+    # UI / user ke switches (cost control)
+    allow_research: bool
+    enable_images: bool
+    max_sections: int
 
-  # reducer/image
-  merged_md: str
-  md_with_placeholders: str
-  image_specs: List[dict]
+    # routing / research
+    mode: str
+    needs_research: bool
+    queries: List[str]
+    evidence: List[EvidenceItem]
+    plan: Optional[Plan]
 
-  final: str
+    # workers
+    sections: Annotated[List[tuple[int, str]], operator.add]  # (task_id,section_md)
+
+    # reducer/image
+    merged_md: str
+    md_with_placeholders: str
+    image_specs: List[dict]
+
+    final: str
+    saved_path: str
 
 # -----------------------------
 # 2) LLM
 # -----------------------------
 
-llm = ChatOpenAI(model="gpt-4.1-mini")
+# max_retries=1 + timeout: fail hone par bar-bar retry karke tokens waste nahi honge
+llm = ChatOpenAI(model="gpt-4.1-mini", temperature=0.3, max_tokens=PLAN_MAX_TOKENS, max_retries=1, timeout=60)
+writer_llm = llm.bind(max_tokens=SECTION_MAX_TOKENS)
 
 # -----------------------------
 # 3) Router (decide upfront)
@@ -122,97 +141,65 @@ Modes:
   Mostly volatile: weekly roundups, "this week", "latest", rankings, pricing, policy/regulation.
 
 If needs_research=true:
-- Output 3–10 high-signal queries.
+- Output 3 high-signal queries (never more than 3).
 - Queries should be scoped and specific (avoid generic queries like just "AI" or "LLM").
 - If user asked for "last week/this week/latest", reflect that constraint IN THE QUERIES.
 """
 
 def router_node(state: State) -> dict:
-  
-  topic = state["topic"]
-  decider = llm.with_structured_output(RouterDecision)
-  decision = decider.invoke(
+    # user ne research band kiya hai -> LLM call bhi bachao
+    if not state.get("allow_research", True):
+        return {"needs_research": False, "mode": "closed_book", "queries": []}
+
+    decider = llm.with_structured_output(RouterDecision)
+    decision = decider.invoke(
         [
             SystemMessage(content=ROUTER_SYSTEM),
-            HumanMessage(content=f"Topic: {topic}"),
+            HumanMessage(content=f"Topic: {state['topic']}"),
         ]
     )
-  
-  return {
-    "needs_research": decision.need_research,
-    "mode": decision.mode,
-    "queries": decision.queries,
-  }
-  
+
+    return {
+        "needs_research": decision.needs_research,
+        "mode": decision.mode,
+        "queries": decision.queries[:MAX_QUERIES],
+    }
+
 def route_next(state: State) -> str:
     return "research" if state["needs_research"] else "orchestrator"
-  
+
 
 # -----------------------------
-# 4) Research (Tavily) 
+# 4) Research (Tavily)
 # -----------------------------
 
-def _tavily_search(query: str, max_results: int = 5) -> List[dict]:
-  
-    tool = TavilySearchResults(max_results=max_results)
-    results = tool.invoke({"query": query})
-    
-    normalized: List[dict] = []
-    for r in results or []:
-        normalized.append(
-            {
-                "title": r.get("title") or "",
-                "url": r.get("url") or "",
-                "snippet": r.get("content") or r.get("snippet") or "",
-                "published_at": r.get("published_date") or r.get("published_at"),
-                "source": r.get("source"),
-            }
+def _tavily_search(query: str) -> List[EvidenceItem]:
+    tool = TavilySearch(max_results=RESULTS_PER_QUERY)
+    res = tool.invoke({"query": query})
+    items = res.get("results", []) if isinstance(res, dict) else []
+
+    return [
+        EvidenceItem(
+            title=r.get("title") or "",
+            url=r["url"],
+            snippet=(r.get("content") or "")[:SNIPPET_CHARS],
+            published_at=r.get("published_date"),
         )
-    return normalized
-  
-
-RESEARCH_SYSTEM = """You are a research synthesizer for technical writing.
-
-Given raw web search results, produce a deduplicated list of EvidenceItem objects.
-
-Rules:
-- Only include items with a non-empty url.
-- Prefer relevant + authoritative sources (company blogs, docs, reputable outlets).
-- If a published date is explicitly present in the result payload, keep it as YYYY-MM-DD.
-  If missing or unclear, set published_at=null. Do NOT guess.
-- Keep snippets short.
-- Deduplicate by URL.
-"""
+        for r in items
+        if r.get("url")
+    ]
 
 def research_node(state: State) -> dict:
-  
-  # take the first 10 queries from state
-  
-  queries = (state.get("queries",[]) or [])[:10]
-  max_results = 6
-  
-  raw_results: List[dict] = []
-  
-  for q in queries:
-        raw_results.extend(_tavily_search(q, max_results=max_results))
+    dedup: dict[str, EvidenceItem] = {}  # url -> item (duplicate URLs hata deta hai)
 
-  if not raw_results:
-        return {"evidence": []}
+    for q in (state.get("queries") or [])[:MAX_QUERIES]:
+        try:
+            for e in _tavily_search(q):
+                dedup.setdefault(e.url, e)
+        except Exception:
+            continue  # ek query fail ho to baaki chalti rahein
 
-extractor = llm.with_structured_output(EvidencePack)
-pack = extractor.invoke([
-        SystemMessage(content=RESEARCH_SYSTEM),
-        HumanMessage(content=f"Raw results:\n{raw_results}"),
-]
-)    
-
-# Deduplicate by URL
-dedup = {}
-for e in pack.evidence:
-    if e.url and e.url not in dedup:
-        dedup[e.url] = e
-        
- return {"evidence": list(dedup.values())}
+    return {"evidence": list(dedup.values())}
 
 
 # -----------------------------
@@ -223,11 +210,11 @@ ORCH_SYSTEM = """You are a senior technical writer and developer advocate.
 Your job is to produce a highly actionable outline for a technical blog post.
 
 Hard requirements:
-- Create 5–9 sections (tasks) suitable for the topic and audience.
+- Create 5–6 sections (tasks) suitable for the topic and audience. Never more than 6.
 - Each task must include:
   1) goal (1 sentence)
   2) 3–6 bullets that are concrete, specific, and non-overlapping
-  3) target word count (120–550)
+  3) target word count (120–450)
 
 Quality bar:
 - Assume the reader is a developer; use correct terminology.
@@ -255,12 +242,12 @@ Output must strictly match the Plan schema.
 """
 
 def orchestrator_node(state: State) -> dict:
-  planner = llm.with_structured_output(Plan)
-  
-  evidence = state.get("evidence", [])
-  mode = state.get("mode", "closed_book")
+    planner = llm.with_structured_output(Plan)
 
-  plan = planner.invoke(
+    evidence = state.get("evidence", [])
+    mode = state.get("mode", "closed_book")
+
+    plan = planner.invoke(
         [
             SystemMessage(content=ORCH_SYSTEM),
             HumanMessage(
@@ -268,13 +255,15 @@ def orchestrator_node(state: State) -> dict:
                     f"Topic: {state['topic']}\n"
                     f"Mode: {mode}\n\n"
                     f"Evidence (ONLY use for fresh claims; may be empty):\n"
-                    f"{[e.model_dump() for e in evidence][:16]}"
+                    f"{[e.model_dump() for e in evidence][:12]}"
                 )
             ),
         ]
     )
 
-  return {"plan": plan}
+    # LLM ne zyada sections diye to bhi hard cap: har section = 1 paid call
+    plan.tasks = plan.tasks[: min(state.get("max_sections", MAX_SECTIONS), MAX_SECTIONS)]
+    return {"plan": plan}
 
 
 # -----------------------------
@@ -294,8 +283,8 @@ def fanout(state: State):
         )
         for task in state["plan"].tasks
     ]
-    
-    
+
+
 # -----------------------------
 # 7) Worker (write one section)
 # -----------------------------
@@ -331,7 +320,7 @@ Style:
 """
 
 def worker_node(payload: dict) -> dict:
-    
+
     task = Task(**payload["task"])
     plan = Plan(**payload["plan"])
     evidence = [EvidenceItem(**e) for e in payload.get("evidence", [])]
@@ -343,11 +332,11 @@ def worker_node(payload: dict) -> dict:
     evidence_text = ""
     if evidence:
         evidence_text = "\n".join(
-            f"- {e.title} | {e.url} | {e.published_at or 'date:unknown'}".strip()
-            for e in evidence[:20]
+            f"- {e.title} | {e.url} | {e.published_at or 'date:unknown'} | {e.snippet or ''}".strip()
+            for e in evidence[:12]
         )
 
-    section_md = llm.invoke(
+    section_md = writer_llm.invoke(
         [
             SystemMessage(content=WORKER_SYSTEM),
             HumanMessage(
@@ -372,9 +361,9 @@ def worker_node(payload: dict) -> dict:
             ),
         ]
     ).content.strip()
-    
+
     return {"sections": [(task.id, section_md)]}
-  
+
 
 # ============================================================
 # 8) ReducerWithImages (subgraph)
@@ -393,18 +382,21 @@ DECIDE_IMAGES_SYSTEM = """You are an expert technical editor.
 Decide if images/diagrams are needed for THIS blog.
 
 Rules:
-- Max 3 images total.
+- Create exactly 3 images (a blog about a visual/technical topic always benefits from 3 diagrams).
 - Each image must materially improve understanding (diagram/flow/table-like visual).
-- Insert placeholders exactly: [[IMAGE_1]], [[IMAGE_2]], [[IMAGE_3]].
-- If no images needed: md_with_placeholders must equal input and images=[].
+- Insert placeholders exactly: [[IMAGE_1]], [[IMAGE_2]], [[IMAGE_3]] (each on its own line, right after the section it explains).
 - Avoid decorative images; prefer technical diagrams with short labels.
 Return strictly GlobalImagePlan.
 """
 
 def decide_images(state: State) -> dict:
-    
-    planner = llm.with_structured_output(GlobalImagePlan)
     merged_md = state["merged_md"]
+
+    # images off (default) -> ye step poora skip: isme poora blog dobara LLM se likhwana padta hai (sabse mehenga step)
+    if not state.get("enable_images", False):
+        return {"md_with_placeholders": merged_md, "image_specs": []}
+
+    planner = llm.bind(max_tokens=IMAGE_PLAN_MAX_TOKENS).with_structured_output(GlobalImagePlan)
     plan = state["plan"]
     assert plan is not None
 
@@ -424,21 +416,21 @@ def decide_images(state: State) -> dict:
 
     return {
         "md_with_placeholders": image_plan.md_with_placeholders,
-        "image_specs": [img.model_dump() for img in image_plan.images],
+        "image_specs": [img.model_dump() for img in image_plan.images[:MAX_IMAGES]],
     }
-    
-    def _gemini_generate_image_bytes(prompt: str) -> bytes:
+
+def _gemini_generate_image_bytes(prompt: str) -> bytes:
     """
     Returns raw image bytes generated by Gemini.
     Requires: pip install google-genai
-    Env var: GOOGLE_API_KEY
+    Env var: GEMINI_API_KEY (ya GOOGLE_API_KEY)
     """
     from google import genai
     from google.genai import types
 
-    api_key = os.environ.get("GOOGLE_API_KEY")
+    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not api_key:
-        raise RuntimeError("GOOGLE_API_KEY is not set.")
+        raise RuntimeError("GEMINI_API_KEY is not set.")
 
     client = genai.Client(api_key=api_key)
 
@@ -474,26 +466,29 @@ def decide_images(state: State) -> dict:
 
     raise RuntimeError("No inline image bytes found in response.")
 
+def _save_markdown(plan: Plan, md: str) -> str:
+    # title me "/" ya ":" ho sakta hai, isliye safe filename banate hain
+    slug = re.sub(r"[^\w\-]+", "_", plan.blog_title).strip("_")[:80] or "blog"
+    OUT_DIR.mkdir(exist_ok=True)
+    path = OUT_DIR / f"{slug}.md"
+    path.write_text(md, encoding="utf-8")
+    return str(path)
+
 def generate_and_place_images(state: State) -> dict:
 
     plan = state["plan"]
     assert plan is not None
 
     md = state.get("md_with_placeholders") or state["merged_md"]
-    image_specs = state.get("image_specs", []) or []
+    image_specs = (state.get("image_specs", []) or [])[:MAX_IMAGES]
 
-    # If no images requested, just write merged markdown
-    if not image_specs:
-        filename = f"{plan.blog_title}.md"
-        Path(filename).write_text(md, encoding="utf-8")
-        return {"final": md}
-
-    images_dir = Path("images")
-    images_dir.mkdir(exist_ok=True)
+    images_dir = OUT_DIR / "images"
+    if image_specs:
+        images_dir.mkdir(parents=True, exist_ok=True)
 
     for spec in image_specs:
         placeholder = spec["placeholder"]
-        filename = spec["filename"]
+        filename = Path(spec["filename"]).name  # LLM ka diya path trust nahi karte (../ se bachne ke liye)
         out_path = images_dir / filename
 
         # generate only if needed
@@ -515,11 +510,12 @@ def generate_and_place_images(state: State) -> dict:
         img_md = f"![{spec['alt']}](images/{filename})\n*{spec['caption']}*"
         md = md.replace(placeholder, img_md)
 
-    filename = f"{plan.blog_title}.md"
-    Path(filename).write_text(md, encoding="utf-8")
-     return {"final": md}
-   
-   # build reducer subgraph
+    # cap ki wajah se jo placeholders bach gaye unhe hata do
+    md = re.sub(r"\[\[IMAGE_\d+\]\]", "", md)
+
+    return {"final": md, "saved_path": _save_markdown(plan, md)}
+
+# build reducer subgraph
 reducer_graph = StateGraph(State)
 reducer_graph.add_node("merge_content", merge_content)
 reducer_graph.add_node("decide_images", decide_images)
@@ -529,8 +525,6 @@ reducer_graph.add_edge("merge_content", "decide_images")
 reducer_graph.add_edge("decide_images", "generate_and_place_images")
 reducer_graph.add_edge("generate_and_place_images", END)
 reducer_subgraph = reducer_graph.compile()
-
-reducer_subgraph
 
 
 # -----------------------------
@@ -552,32 +546,40 @@ g.add_edge("worker", "reducer")
 g.add_edge("reducer", END)
 
 app = g.compile()
-app
+
 
 # -----------------------------
 # 10) Runner
 # -----------------------------
-def run(topic: str, as_of: Optional[str] = None):
-    if as_of is None:
-        as_of = date.today().isoformat()
+def initial_state(
+    topic: str,
+    allow_research: bool = True,
+    enable_images: bool = False,
+    max_sections: int = MAX_SECTIONS,
+) -> dict:
+    return {
+        "topic": topic.strip()[:300],  # bahut lamba topic = faltu input tokens
+        "allow_research": allow_research,
+        "enable_images": enable_images,
+        "max_sections": max_sections,
+        "mode": "",
+        "needs_research": False,
+        "queries": [],
+        "evidence": [],
+        "plan": None,
+        "sections": [],
+        "merged_md": "",
+        "md_with_placeholders": "",
+        "image_specs": [],
+        "final": "",
+        "saved_path": "",
+    }
 
-    out = app.invoke(
-        {
-            "topic": topic,
-            "mode": "",
-            "needs_research": False,
-            "queries": [],
-            "evidence": [],
-            "plan": None,
-            "as_of": as_of,
-            "recency_days": 7,
-            "sections": [],
-            "merged_md": "",
-            "md_with_placeholders": "",
-            "image_specs": [],
-            "final": "",
-        }
-    )
+def run(topic: str, **options):
+    return app.invoke(initial_state(topic, **options), config={"recursion_limit": 25})
 
-    return out
-run("Self Attention in Transformer Architecture")
+
+if __name__ == "__main__":
+    # sirf `python ai-blog-writer-agent.py` chalane par run hoga (import par nahi: warna UI khulte hi paise kharch)
+    out = run("Self Attention in Transformer Architecture")
+    print(f"Saved: {out['saved_path']}")

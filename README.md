@@ -48,6 +48,9 @@ START ──► chat_node ──(tool call?)──► tools ──┐
 | [streamlit_frontend.py](streamlit_frontend.py) | **Main UI.** Streaming, tool status pill, image gallery, source chips, sidebar chat history, suggestion cards |
 | [streamlit_frontend_streming.py](streamlit_frontend_streming.py) | Earlier, minimal UI with streaming only (no tool UI or styling). Kept as a simple reference |
 | [.streamlit/config.toml](.streamlit/config.toml) | Streamlit theme (colors, font, radius) |
+| [ai-agent/ai-blog-writer-agent.py](ai-agent/ai-blog-writer-agent.py) | LangGraph blog-writer agent (router, research, planner, parallel writers, merger, optional images) |
+| [ai-agent/blog_writer_ui.py](ai-agent/blog_writer_ui.py) | Streamlit UI for the blog-writer agent |
+| `ai-agent/blogs/` | Generated blogs (`.md`) and images (created automatically, git-ignored) |
 | `chatbot.db` | SQLite database holding the saved conversations (created automatically, git-ignored) |
 
 ## Getting started
@@ -117,13 +120,74 @@ To try the minimal version instead, run `streamlit run streamlit_frontend_stremi
 - **Change the persona.** Edit `SYSTEM_PROMPT` in the backend. It is added on every call and is not stored in the database.
 - **Restyle the UI.** The color tokens are at the top of `CUSTOM_CSS` in [streamlit_frontend.py](streamlit_frontend.py), and match [.streamlit/config.toml](.streamlit/config.toml). Restart Streamlit after changing the theme file.
 
+## AI Blog Writer agent
+
+A second app in [ai-agent/](ai-agent/). You give it a topic and it writes a full technical blog post in Markdown. It uses OpenAI (`gpt-4.1-mini`) for writing, Tavily for research and, optionally, Gemini for images.
+
+```
+START ─► router ──(needs research?)──► research ─┐
+            │                                    ▼
+            └──────(no)──────────────────► orchestrator (plan)
+                                                 │  fan-out (one worker per section)
+                                                 ▼
+                                      worker × N (parallel)
+                                                 │
+                                                 ▼
+                                reducer: merge ─► decide images ─► save .md ─► END
+```
+
+1. **router** decides if the topic needs fresh web facts (`closed_book`, `hybrid` or `open_book`) and writes up to 3 search queries.
+2. **research** runs the queries on Tavily and removes duplicate URLs.
+3. **orchestrator** plans the blog: title, audience, tone and 5 to 6 sections, each with a goal, bullets and a word target.
+4. **worker** writes one section. All sections are written in parallel.
+5. **reducer** sorts the sections, merges them, optionally adds images, and saves the file to `ai-agent/blogs/`.
+
+### Run the UI
+
+```bash
+pip install langchain-openai langchain-tavily langgraph pydantic streamlit python-dotenv
+# only if you turn on AI images:
+pip install google-genai
+
+cd ai-agent && streamlit run blog_writer_ui.py
+```
+
+Start it from inside `ai-agent/` so its own theme (`ai-agent/.streamlit/config.toml`: dark OLED, green accent, IBM Plex Sans) is used. You can also run the agent without the UI: `python ai-agent/ai-blog-writer-agent.py`.
+
+Needed in `.env`: `OPENAI_API_KEY`. Optional: `TAVILY_API_KEY` (research), `GEMINI_API_KEY` (images).
+
+### Token and cost safety
+
+A normal run is about 6 to 8 OpenAI calls, roughly 10k to 15k tokens on `gpt-4.1-mini`, which is a few cents at most. These guards keep it that way:
+
+| Guard | Value | Where to change |
+|---|---|---|
+| Max sections per blog (1 paid call each) | 6 | `MAX_SECTIONS` |
+| Output cap per section | 1000 tokens | `SECTION_MAX_TOKENS` |
+| Output cap for router and planner | 2000 tokens | `PLAN_MAX_TOKENS` |
+| Tavily searches / results per search | 3 / 4 | `MAX_QUERIES`, `RESULTS_PER_QUERY` |
+| Evidence snippet length | 200 chars | `SNIPPET_CHARS` |
+| OpenAI retries and timeout | 1 retry, 60 s | `llm = ChatOpenAI(...)` |
+| Topic length | 200 chars in the UI, 300 in the agent | `MAX_TOPIC_CHARS`, `initial_state` |
+| Runs per browser session | 5 | `MAX_RUNS_PER_SESSION` in the UI |
+| AI images | **off by default**, 3 when on | UI toggle, `MAX_IMAGES` |
+| Web research | on, can be turned off in the UI (also skips the router call) | UI toggle |
+| Graph loop limit | 25 steps | `recursion_limit` |
+
+Notes:
+- Images are the most expensive part. Turning them on makes OpenAI rewrite the whole blog once (to insert placeholders) and adds 3 Gemini image calls.
+- The session limit resets when you refresh the page. It protects against accidental clicks, not against abuse. For a public deployment, set a spending limit in the OpenAI and Google dashboards.
+- Importing the agent does not call any API. Only `run()`, the UI button, or `python ai-blog-writer-agent.py` do.
+- LangSmith tracing (if enabled in `.env`) records the calls but does not add tokens.
+
 ## Tech stack
 
 | Layer | Technology |
 |---|---|
 | UI | Streamlit |
 | Agent orchestration | LangGraph, LangChain |
-| LLM | `openai/gpt-oss-120b` via Groq (`langchain-groq`) |
+| LLM (chat) | `openai/gpt-oss-120b` via Groq (`langchain-groq`) |
+| LLM (blog writer) | `gpt-4.1-mini` via OpenAI (`langchain-openai`), optional Gemini for images |
 | Web search | Tavily (`langchain-tavily`) |
 | Persistence | SQLite with LangGraph `SqliteSaver` |
 | Tracing (optional) | LangSmith |
