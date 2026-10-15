@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 chatbot.db
 ai-agent/blogs/
+.venv/
