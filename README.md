@@ -1,5 +1,5 @@
 # JPT — AI Chat Assistant with Web Search
-# dummy deploy 
+
 JPT is a conversational AI assistant with a dark, ChatGPT-style web interface. It remembers every conversation, streams answers token by token, and can search the web, do math and check the time. When it searches, it shows image galleries and source links next to its answer.
 
 It is built with **LangGraph** (agent workflow), **Groq** (LLM inference), **Tavily** (web search) and **Streamlit** (UI).
